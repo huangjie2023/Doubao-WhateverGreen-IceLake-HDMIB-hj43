@@ -1,0 +1,930 @@
+//
+//  kern_igfx_hdmib.hpp
+//  HDMI on DDI B for AppleIntelICLLPGraphicsFramebuffer (Intel Ice Lake, macOS 15 / 26)
+//
+//  Header-only module for WhateverGreen. Version 1.0-rc6 (internally "v46").
+//
+//  Why it exists
+//  -------------
+//  Apple's Ice Lake framebuffer driver only knows DisplayPort sinks on DDI B: it detects a monitor with DPCD reads over the
+//  AUX channel, which an HDMI sink does not have. Plugging an HDMI cable therefore logs "Hotplug detected on unsupported ddi 1"
+//  and nothing lights up. This module teaches the driver to treat that port as an HDMI/TMDS sink:
+//    * HPD-only sink detection (no AUX / DPCD) for the HDMI port;
+//    * its own EDID reader (GMBUS, GPIO bit-bang as a fallback), because Apple's DDC path is DisplayPort-oriented;
+//    * the plumbing Apple's AGDC client never does for an injected framebuffer (display path, resource configuration,
+//      connect event, hardware cursor memory), and the display-buffer (DBUF) slice 2 power-up that pipe B needs;
+//    * work-arounds for panics and stalls that appear with HDMI hot-plugging (DC6 double-enable, AUX timeouts, VRR errors).
+//
+//  Requirements (v1 / huangjie fork: NONE)
+//  ---------------------------------------
+//    This fork ("1.0-hj1") is self-contained: no boot arguments and no DeviceProperties are needed.
+//    * The module is active by default (the upstream switch -igfxhdmib is gone). Optional escape hatch: -igfxhdmiboff.
+//    * The HDMI connector the upstream README asks you to add with framebuffer-patch0-find/-replace is injected here as
+//      virtual DeviceProperties on the iGPU (injectDeviceProperties, called from IGFX::processKernel before
+//      loadPatchesFromDevice), so WhateverGreen's own connector-patch code applies it exactly as documented.
+//    * If framebuffer-patch0-find already exists on the iGPU, the existing configuration wins and nothing is injected.
+//
+//  Boot-args (all optional)
+//    igfxhdmib-ddi=N          DDI that carries the HDMI port (default 1 = DDI B)
+//    igfxhdmib-fb=N           framebuffer index of that port (default: 2, then taken from the driver at the first hotplug)
+//    igfxhdmib-bootdetect=S   if the cable is already plugged at boot, run the hotplug S seconds after the first mode set
+//                             (default 3, 0 = off). Apple never raises a hotplug for a cable that was plugged before boot.
+//    igfxhdmib-hwcursor=0|1   1 (default) = real hardware cursor on the HDMI framebuffer, 0 = software cursor there
+//    igfxhdmib-swcursor=1     software cursor on every framebuffer
+//    igfxhdmib-aux=0          do not short-circuit the AUX reads the accelerator keeps issuing for the HDMI stream
+//    igfxhdmib-dc6fix=0       do not skip the second enableHWDC6() (panic "DC6 is already enabled")
+//    igfxhdmib-edid-fallback=1  if the monitor's EDID cannot be read, present a generic 1024x768@60 EDID instead of nothing
+//    igfxhdmib-rgb=-1|0|1|2   colour-format control. A sink that advertises YCbCr makes the driver send YCbCr 4:4:4 in the HDMI AVI
+//                             infoframe, which this path cannot handle (purple/magenta picture).
+//                               -1 (default) = automatic: if the EDID advertises YCbCr, behave as 2; otherwise leave the EDID untouched
+//                                2 = hide YCbCr support AND the CEA extension block, the sink is treated as plain DVI/RGB (no infoframes)
+//                                1 = only hide the YCbCr bits   0 = never touch the EDID
+//    igfxhdmib-force=1        run on a macOS version whose private structure layout has not been verified (see Layout)
+//
+//  Diagnostics:  ioreg -l | grep HDMIB      (HDMIB-status, HDMIB-layout, HDMIB-hooks)
+//                dmesg | grep HDMIB
+//
+//  The module touches private, undocumented structures of Apple's kext. The offsets live in ONE table (Layout) keyed by the
+//  Darwin major version; on a version that is not in the table the module stays idle instead of risking a kernel panic.
+//
+
+#ifndef kern_igfx_hdmib_hpp
+#define kern_igfx_hdmib_hpp
+
+#include "kern_igfx_kexts.hpp"
+#include <Headers/kern_patcher.hpp>
+#include <Headers/kern_util.hpp>
+#include <Headers/kern_api.hpp>
+#include <IOKit/IORegistryEntry.h>
+#include <IOKit/IOService.h>
+#include <IOKit/IOWorkLoop.h>
+#include <IOKit/IOTimerEventSource.h>
+
+namespace HDMIB {
+
+	static constexpr const char *Version = "1.0-hj43";
+
+	// IOLog directly: Lilu's SYSLOG is silent when interrupts are disabled (hotplug paths run that way).
+	#define HLOG(fmt, ...) do { if (ml_get_interrupts_enabled()) IOLog("HDMIB: " fmt "\n", ## __VA_ARGS__); } while (0)
+	#define HLOG_ALWAYS(fmt, ...) IOLog("HDMIB: " fmt "\n", ## __VA_ARGS__)
+
+	// ---------------------------------------------------------------------------------------------------------------------
+	// Private structure layout of Apple's kext, per Darwin major version.
+	// The defaults are the offsets verified against the macOS 26 (Darwin 25) kext. A version is only used if it is listed in
+	// `layouts` AND marked verified (or the user passes igfxhdmib-force=1).
+	// ---------------------------------------------------------------------------------------------------------------------
+	struct Layout {
+		// AppleIntelPort
+		uint32_t portConfig     = 0x440;   // PortConfig *
+		uint32_t portState      = 0x44c;   // last probe result: 0 = nothing, 1 = sink, 2 = error
+		uint32_t portIndex      = 0x1c;    // index of the framebuffer that owns the port
+		// AppleIntelFramebuffer
+		uint32_t fbIndex        = 0x1dc;   // framebuffer number (0 = internal panel)
+		uint32_t fbFlags        = 0x1e0;   // bit 0 = "online/active"
+		uint32_t fbCursorMem    = 0x1f8;   // two u32 cursor buffer addresses
+		uint32_t fbCfgTable     = 0x20d;   // resource-configuration table (count + entries)
+		uint32_t fbCfgTableLen  = 0x3e0;
+		uint32_t fbPathSel      = 0x7d9c;  // u32: 0xffffffff selects fbPath0, anything else fbPathAlt
+		uint32_t fbPathCount    = 0x8f28;  // number of display paths
+		uint32_t fbPath0        = 0x8f30;  // AppleIntelDisplayPath *
+		uint32_t fbPathAlt      = 0x8f48;
+		uint32_t fbVrr          = 0x8f75;  // five VRR capability bytes
+		uint32_t pathPort       = 0x4d20;  // AppleIntelDisplayPath::port
+		// AppleIntelFramebufferController
+		uint32_t ctlFbCount     = 0xd14;   // u32
+		uint32_t ctlFbArray     = 0xd18;   // AppleIntelFramebuffer *[3]
+		uint32_t ctlCursorPhys  = 0xd78;   // u64 base of the cursor region (physical)
+		uint32_t ctlCursorSize  = 0xd80;   // u32
+		uint32_t ctlCursorCpu   = 0xc58;   // u64 CPU mapping of the cursor region
+		uint32_t ctlDC6Count    = 0xbf4;   // s32 enableHWDC6/disableHWDC6 reference count
+		// AGDC client structure passed to CallBackAGDC
+		uint32_t agdcCfgIndex   = 0xac;    // s32 resource-configuration entry chosen for a link-modeset callback
+	};
+	struct LayoutEntry { uint32_t darwin; bool verified; const char *name; Layout l; };
+	static const LayoutEntry layouts[] = {
+		{25, true,  "macOS 26 (Tahoe)",   Layout{}},
+		// Sequoia: verified 2026-11 on macOS 15.8.2 (24H232). Static: tools/layout_fingerprint.py shows every Layout offset is used by the
+		// same functions as on macOS 26 (reference_darwin25.json vs reference_darwin24.json); the 5 hooked functions whose code differs
+		// only touch fields that are not in Layout. Dynamic: HDMI hot-plug, EDID, mode set and cursor ran on an i5-1035G1 (X415JA).
+		{24, true,  "macOS 15 (Sequoia)", Layout{}},
+	};
+	static const Layout *L = nullptr;
+
+	// Hardware registers (Ice Lake).
+	static constexpr unsigned long REG_PWR_WELL_CTL2 = 0x45404;
+	static constexpr unsigned long REG_DBUF_CTL_S1   = 0x45008;
+	static constexpr unsigned long REG_DBUF_CTL_S2   = 0x44fe8;
+	static constexpr unsigned long REG_GMBUS0 = 0xC5100, REG_GMBUS1 = 0xC5104, REG_GMBUS2 = 0xC5108, REG_GMBUS3 = 0xC510C,
+	                               REG_GMBUS4 = 0xC5110, REG_GMBUS5 = 0xC5120, REG_GPIO_BASE = 0xC5010;
+
+	// PortConfig as stored by the platform table: six u32 {ddi, gmbus pin, class, pad, type, flags}
+	struct PortConfig { uint32_t ddi, gmbus, cls, pad, type, flags; };
+
+	// ---------------------------------------------------------------------------------------------------------------------
+	// State
+	// ---------------------------------------------------------------------------------------------------------------------
+	static uint32_t tddi = 1;                 // target DDI
+	static int      fbIdx = 2;                // target framebuffer index
+	static bool     fbIdxFixed = false;       // set by igfxhdmib-fb
+	static int      rgbMode = -1, rgbOnly = 0, hwCursorFb = 1, swCursorAll = 0, auxBlockEnabled = 0, dc6FixEnabled = 1, edidFallback = 0, bootDetectSec = 3;
+	static void    *gCtl = nullptr;           // AppleIntelFramebufferController, captured at the first hotplug
+
+	static void *(*getPortByDDI)(uint32_t) = nullptr;
+	static bool (*isHPDLow)(void *) = nullptr;
+	static uint32_t (*readReg)(void *, unsigned long) = nullptr;
+	static void (*writeReg)(void *, unsigned long, uint32_t) = nullptr;
+	static uint32_t (*connChanged)(void *) = nullptr;
+	static void *(*addDispPath)(void *, uint32_t) = nullptr;
+	static uint8_t (*allocPathRes)(void *, uint32_t, uint32_t) = nullptr;
+	static void (*injectHPD)(void *, void *) = nullptr;
+	static void (*orgUpdateCursorMem)(void *, void *) = nullptr;
+
+	static uint32_t (*orgProbePortState)(void *) = nullptr;
+	static IOReturn (*orgGetOnlineInfo)(void *, void *, uint8_t *, uint8_t *) = nullptr;
+	static void (*orgHotplug)(void *, uint32_t, uint32_t) = nullptr;
+	static int (*orgSetDPPower)(void *, uint8_t) = nullptr;
+	static int (*orgGetSinkCount)(void *, uint8_t *) = nullptr;
+	static int (*orgGetDPCDInfo)(void *) = nullptr;
+	static int (*orgGetDDCBlock)(void *, uint32_t, uint8_t *, bool) = nullptr;
+	static IOReturn (*orgStreamAux)(void *, void *, void *) = nullptr;
+	static bool (*orgCallbackAGDC)(void *, uint32_t, unsigned long, uint32_t) = nullptr;
+	static uint32_t (*orgLightUpTMDS)(void *, void *, void *, void *) = nullptr;
+	static uint32_t (*orgHwSetMode)(void *, void *, void *, int, void *) = nullptr;
+	static uint32_t (*orgHwSetCursorImage)(void *, void *, void *) = nullptr;
+	static uint32_t (*orgHwSetCursorState)(void *, void *, int, int, bool, bool) = nullptr;
+	static void (*orgInitVRRCaps)(void *) = nullptr;
+	static void (*orgEnableHWDC6)(void *) = nullptr;
+
+	static uint32_t edidForgotten = 0, hotplugs = 0, lastPortMode = 0, edidReads = 0, edidFails = 0, dbufCalls = 0, dc6Skipped = 0, auxBlocked = 0,
+	                cursorBlocked = 0, vrrOff = 0, hpdLowProbes = 0;
+	static uint32_t senDbufS1 = 0xdeadbeef, senDbufS2 = 0xdeadbeef;
+	// Software-only counters for the I2C path. They touch no hardware at all: incrementing a static is free and cannot
+	// perturb Apple's power management. Every previous hypothesis (AUX block, force-online, DBUF slice 2, DBUF size)
+	// failed for the same reason - there was no measurement of *how often* this module actually drives the PCH I2C
+	// controller. These four numbers are that measurement.
+	//   enpw     = times ensurePW() really wrote PWR_WELL_CTL2 (i.e. bypassed Apple's power-well refcount)
+	//   gmbus    = GMBUS transactions attempted (each one is ~110 MMIO accesses for a 128-byte block)
+	//   gpio     = GPIO bit-bang attempts (the destructive path: gSCL/gSDA rewrite the whole GPIO register)
+	//   edidfull = full EDID re-reads, i.e. the cache was dropped and up to 54 tryBlock() calls follow
+	static uint32_t enpwWrites = 0, gmbusCalls = 0, gpioCalls = 0, edidFullReads = 0;
+	// Read-only sentinel. These values are the ones that would have to accumulate if the port slowly loses its display
+	// path across sleep cycles. Nothing is written here, every offset is one that the module already uses.
+	static uint32_t senIdx = 0, senPaths = 0, senFlags = 0, senPw2 = 0, senPst = 0xffffffff;
+
+	// ---------------------------------------------------------------------------------------------------------------------
+	// Helpers
+	// ---------------------------------------------------------------------------------------------------------------------
+	static inline bool ptrOk(const void *p) {
+		auto v = reinterpret_cast<uintptr_t>(p);
+		return v >= 0xffff800000000000ULL && (v & 0x3) == 0;
+	}
+	template <typename T> static inline T rd(const void *base, uint32_t off) { return *reinterpret_cast<const T *>(static_cast<const uint8_t *>(base) + off); }
+	template <typename T> static inline void wr(void *base, uint32_t off, T v) { *reinterpret_cast<T *>(static_cast<uint8_t *>(base) + off) = v; }
+
+	// ---------------------------------------------------------------------------------------------------------------------
+	// v3 (based on v1): make the ig-platform-id entry reachable when it sits behind the first page.
+	//
+	// WhateverGreen looks the entry for the requested ig-platform-id up with
+	//     findFramebufferId(framebufferId, gPlatformInformationList, PAGE_SIZE)
+	// i.e. it only looks at the first PAGE_SIZE (4096 bytes) of the ig-platform-id table. The table is built at
+	// kext-init time by a static initialiser inside the framebuffer kext into its writable __DATA,__bss. On Darwin 25
+	// the ICLLP table holds 23 entries of 0x118 bytes (0x118 = sizeof(FramebufferICLLP)), the entry id is the first
+	// uint32 of an entry:
+	//
+	//     entry #13  0x8A5C0001  offset 3640   inside the 4096 byte window  -> the connector patch was applied
+	//     entry #20  0x8A5C0002  offset 5600   behind it                     -> the connector patch was never applied
+	//
+	// With 0x8A5C0002 the lookup returned null, so WhateverGreen skipped its complete framebuffer-patch block and the
+	// ICLLP framebuffer kext never received an HDMI connector. The author's find/replace pair itself is correct for
+	// 0x8A5C0002 - entry #20 uses the very same connector table as entry #12/#14/#19 (the shared three-port table that
+	// contains {3,10,1,1,0x400,0x2c1}) - it simply was never reached.
+	//
+	// The fix belongs in WhateverGreen's own lookup, not in a private copy of the table: the entry and its connector
+	// rows live in the framebuffer kext's writable __bss, so WhateverGreen's regular patch code writes to memory that
+	// is meant to be written. Only the size of the window changes, nothing else.
+	//
+	// The table ends with a 0xFFFFFFFF framebufferId. Apple writes the terminator as FFFFFFFF FFFFFFFF on Darwin 25
+	// (ICLLP) and as FFFFFFFF 00000000 elsewhere - WhateverGreen's own calculatePlatformListSize() only knows the
+	// latter and therefore does not find the ICLLP one. Both are accepted here and the last pair inside a bounded
+	// window is used, so that a 0xFFFFFFFF inside an entry cannot shorten the table. When no terminator is found the
+	// original one-page behaviour is kept.
+	//
+	// There is no risk of a wrong match: the value 0x8A5C0002 does not occur in any data section of the framebuffer
+	// kext - only as the immediate of the store that fills in entry #20 - so it can only ever be found where it belongs.
+	// ---------------------------------------------------------------------------------------------------------------------
+	static constexpr size_t PlatformListWindow = 0x2000;    // 8 KiB, far more than the 6448 byte ICLLP table
+
+	static size_t platformListSize(const void *platformInformationList) {
+		auto *p = reinterpret_cast<const uint32_t *>(platformInformationList);
+		if (!p) return 0;
+		size_t found = 0;
+		size_t words = PlatformListWindow / sizeof(uint32_t) - 1;
+		for (size_t i = 0; i < words; i++) {
+			if (p[i] != 0xffffffffu) continue;
+			if (p[i + 1] == 0xffffffffu || p[i + 1] == 0u)
+				found = (i + 2) * sizeof(uint32_t);
+		}
+		return found;
+	}
+
+	static inline const PortConfig *configOf(void *port) {
+		if (!L || !ptrOk(port)) return nullptr;
+		auto cfg = rd<PortConfig *>(port, L->portConfig);
+		return ptrOk(cfg) ? cfg : nullptr;
+	}
+
+	// Registry channel (`ioreg -l | grep HDMIB`); only touched when interrupts are enabled (never from locked hotplug leaves).
+	static inline void setRoot(const char *key, const char *value) {
+		auto root = IORegistryEntry::getRegistryRoot();
+		if (root && ml_get_interrupts_enabled()) root->setProperty(key, value);
+	}
+	static uint8_t  liveEdid[256];
+	static bool     liveEdidOk = false;
+	static uint32_t gmPin = 0xff, gmMode = 0, gmBlocks = 0;
+	static void publishStatus() {
+		if (!ml_get_interrupts_enabled()) return;
+		char s[192];
+		snprintf(s, sizeof(s), "hotplugs=%u hpdlow=%u edid-ok=%u edid-fail=%u dbuf-calls=%u dc6-skipped=%u aux-blocked=%u cursor-blocked=%u fb=%d ddi=%u",
+		         hotplugs, hpdLowProbes, edidReads, edidFails, dbufCalls, dc6Skipped, auxBlocked, cursorBlocked, fbIdx, tddi);
+		setRoot("HDMIB-status", s);
+		{
+			// Software-only counters: how often the PCH I2C path actually ran. No register is read for these.
+			char si[128];
+			snprintf(si, sizeof(si), "enpw=%u gmbus=%u gpio=%u edidfull=%u pin=%u mode=%u",
+			         enpwWrites, gmbusCalls, gpioCalls, edidFullReads, gmPin, gmMode);
+			setRoot("HDMIB-i2c", si);
+		}
+		{
+			char sn[128];
+			snprintf(sn, sizeof(sn), "fb=%u paths=%u flags=0x%x pwrwell2=0x%08x portstate=%u dbufs1=0x%08x dbufs2=0x%08x",
+			         senIdx, senPaths, senFlags, senPw2, senPst, senDbufS1, senDbufS2);
+			setRoot("HDMIB-sentinel", sn);
+		}
+		if (liveEdidOk) {
+			char e[224];
+			const uint8_t *d = liveEdid;
+			char m[4] = { (char)(64 + ((d[8] >> 2) & 31)), (char)(64 + (((d[8] & 3) << 3) | (d[9] >> 5))), (char)(64 + (d[9] & 31)), 0 };
+			snprintf(e, sizeof(e), "mfg=%s product=0x%02x%02x serial=0x%02x%02x%02x%02x year=%u blocks=%u bpc-byte=0x%02x input=0x%02x feat=0x%02x ext=%u cea3=0x%02x rgb=%d forgotten=%u",
+			         m, d[11], d[10], d[15], d[14], d[13], d[12], 1990u + d[17], gmBlocks, d[20] & 0x70, d[20], d[24], d[126], gmBlocks >= 2 ? d[131] : 0, rgbOnly, edidForgotten);
+			setRoot("HDMIB-edid", e);
+		} else setRoot("HDMIB-edid", "none (Apple's own answer is used)");
+		// Self-diagnosis of the connector table: shows what the driver really has on the target DDI.
+		auto cfg = getPortByDDI ? configOf(getPortByDDI(tddi)) : nullptr;
+		if (cfg) {
+			char c[160];
+			snprintf(c, sizeof(c), "ddi=%u gmbus=%u class=%u type=0x%x flags=0x%x %s", cfg->ddi, cfg->gmbus, cfg->cls, cfg->type, cfg->flags,
+			         (cfg->type & 0x800) ? "OK (HDMI)" : "NOT HDMI: framebuffer-patch0 missing or does not match - module idle");
+			setRoot("HDMIB-port", c);
+		}
+	}
+
+	static inline bool isTarget(void *port) { auto c = configOf(port); return c && c->ddi == tddi && (c->type & 0x800); }  // 0x800 = HDMI connector type: a real DP port on this DDI is never touched
+	static inline bool isTargetFb(void *fb) { return L && ptrOk(fb) && rd<uint32_t>(fb, L->fbIndex) == (uint32_t)fbIdx; }
+
+	// Apple keeps power wells 2 and 3 down while only the internal panel is lit; GMBUS and DDI B need them.
+	static void ensurePW() {
+		if (!gCtl || !readReg || !writeReg) return;
+		uint32_t v = readReg(gCtl, REG_PWR_WELL_CTL2);
+		// HSW-style layout: well n has STATE at bit 2n and REQUEST at bit 2n+1 (PW1..PW3 -> 0x3f)
+		if ((v & 0x3f) != 0x3f) {
+			enpwWrites++;                      // observation: Apple's power-well refcount does not know about this write
+			writeReg(gCtl, REG_PWR_WELL_CTL2, v | 0x2a);
+			for (int i = 0; i < 100; i++) {
+				if ((readReg(gCtl, REG_PWR_WELL_CTL2) & 0x15) == 0x15) break;
+				IOSleep(1);
+			}
+		}
+	}
+
+	// DBUF slice state is read-only. The earlier slice-2 power/enable write was measured as a wake corruption path:
+	// after sleep Apple clears the slice-size bits of both slices, so copying S1 into S2 could enable S2 with size 0.
+	// Apple programs the slices correctly itself; sample the registers for diagnosis instead of rewriting them.
+	static void sampleDbuf(void *ctl) {
+		if (!readReg || !ctl) return;
+		dbufCalls++;
+		senDbufS1 = readReg(ctl, REG_DBUF_CTL_S1);
+		senDbufS2 = readReg(ctl, REG_DBUF_CTL_S2);
+	}
+
+	// ---------------------------------------------------------------------------------------------------------------------
+	// EDID: GMBUS (with a Linux-style controller reset after a NAK) and a GPIO bit-bang fallback.
+	// ---------------------------------------------------------------------------------------------------------------------
+	extern "C" uint64_t mach_absolute_time(void);
+
+	static void gmbusReset(void *ctl) {
+		writeReg(ctl, REG_GMBUS1, 1u << 31);    // GMBUS_SW_CLR_INT
+		writeReg(ctl, REG_GMBUS1, 0);
+		writeReg(ctl, REG_GMBUS0, 0);
+		writeReg(ctl, REG_GMBUS2, 0x8000);      // drop INUSE
+	}
+	static bool gmbusWaitFlag(void *ctl, uint32_t mask, bool wantSet) {
+		for (int i = 0; i < 400; i++) {         // 10 ms max per wait
+			uint32_t v = readReg(ctl, REG_GMBUS2);
+			if (v & 0x400) return false;        // NAK
+			if (wantSet ? (v & mask) : !(v & mask)) return true;
+			IODelay(25);
+		}
+		return false;                           // timeout
+	}
+	static void gmbusStop(void *ctl) {
+		writeReg(ctl, REG_GMBUS1, (4u << 25) | (1u << 30));   // CYCLE_STOP | SW_RDY
+		gmbusWaitFlag(ctl, 0x200, false);                     // wait !ACTIVE
+		writeReg(ctl, REG_GMBUS0, 0);
+		writeReg(ctl, REG_GMBUS2, 0x8000);
+	}
+	// read `len` bytes from slave 0x50 starting at `off`; method 0 = index read, 1 = write offset + read
+	static bool gmbusReadChunk(void *ctl, uint32_t pin, uint32_t off, uint8_t *out, uint32_t len, int method) {
+		gmbusCalls++;
+		gmbusReset(ctl);
+		writeReg(ctl, REG_GMBUS4, 0);                       // no irq
+		writeReg(ctl, REG_GMBUS5, 0);                       // no 2-byte index
+		writeReg(ctl, REG_GMBUS0, pin);                     // pin pair, 100 kHz
+		if (method == 1) {
+			writeReg(ctl, REG_GMBUS3, off & 0xff);          // offset byte
+			writeReg(ctl, REG_GMBUS1, (1u << 25) | (1u << 16) | (0x50u << 1) | (1u << 30)); // WAIT, 1 byte, write, SW_RDY
+			if (!gmbusWaitFlag(ctl, 0x800, true)) { gmbusReset(ctl); return false; }
+			writeReg(ctl, REG_GMBUS1, (1u << 25) | (len << 16) | (0x50u << 1) | 1u | (1u << 30));
+		} else {
+			writeReg(ctl, REG_GMBUS1, (2u << 25) | (1u << 25) | ((off & 0xff) << 8) | (len << 16) | (0x50u << 1) | 1u | (1u << 30));
+		}
+		for (uint32_t got = 0; got < len; ) {
+			if (!gmbusWaitFlag(ctl, 0x800, true)) { gmbusReset(ctl); return false; }
+			uint32_t v = readReg(ctl, REG_GMBUS3);
+			for (int k = 0; k < 4 && got < len; k++) { out[got++] = v & 0xff; v >>= 8; }
+		}
+		gmbusStop(ctl);
+		return true;
+	}
+	// GPIO bit-bang I2C (i915 intel_gpio_algo style). pin 1..3 -> GPIOB..GPIOD
+	static unsigned long gR = 0;
+	static unsigned long gpioRegFor(uint32_t pin) { return REG_GPIO_BASE + 4 * pin; }
+	static void gSCL(void *ctl, int hi) { uint32_t keep = readReg(ctl, gR) & ((1u << 13) | (1u << 5)); writeReg(ctl, gR, keep | (hi ? 0x1u : 0x7u)); }
+	static void gSDA(void *ctl, int hi) { uint32_t keep = readReg(ctl, gR) & ((1u << 13) | (1u << 5)); writeReg(ctl, gR, keep | (hi ? 0x100u : 0x700u)); }
+	static int gGetSDA(void *ctl) { return (readReg(ctl, gR) & (1u << 12)) != 0; }
+	static int gGetSCL(void *ctl) { return (readReg(ctl, gR) & (1u << 4)) != 0; }
+	static void gSclHigh(void *ctl) {
+		gSCL(ctl, 1);
+		for (int i = 0; i < 500 && !gGetSCL(ctl); i++) IODelay(10);   // clock stretching
+		IODelay(10);
+	}
+	static void gStart(void *ctl) { gSDA(ctl, 1); gSclHigh(ctl); gSDA(ctl, 0); IODelay(10); gSCL(ctl, 0); IODelay(10); }
+	static void gStop(void *ctl) { gSDA(ctl, 0); IODelay(10); gSclHigh(ctl); gSDA(ctl, 1); IODelay(20); }
+	static bool gWrite(void *ctl, uint8_t b) {
+		for (int i = 7; i >= 0; i--) { gSDA(ctl, (b >> i) & 1); IODelay(5); gSclHigh(ctl); gSCL(ctl, 0); IODelay(5); }
+		gSDA(ctl, 1); IODelay(5); gSclHigh(ctl);
+		bool ack = !gGetSDA(ctl);
+		gSCL(ctl, 0); IODelay(5);
+		return ack;
+	}
+	static uint8_t gRead(void *ctl, bool ack) {
+		uint8_t v = 0;
+		gSDA(ctl, 1);
+		for (int i = 0; i < 8; i++) { gSclHigh(ctl); v = (uint8_t)((v << 1) | (gGetSDA(ctl) ? 1 : 0)); gSCL(ctl, 0); IODelay(5); }
+		gSDA(ctl, ack ? 0 : 1); IODelay(5); gSclHigh(ctl); gSCL(ctl, 0); IODelay(5); gSDA(ctl, 1);
+		return v;
+	}
+	static bool gpioReadBlock(void *ctl, uint32_t pin, uint32_t off, uint8_t *out, uint32_t len) {
+		gpioCalls++;                           // observation: this path rewrites the GPIO register and never restores it
+		gR = gpioRegFor(pin);
+		gmbusReset(ctl);
+		writeReg(ctl, REG_GMBUS4, 0);
+		gSDA(ctl, 1); gSCL(ctl, 1); IODelay(50);
+		gStart(ctl);
+		if (!gWrite(ctl, 0x50 << 1)) { gStop(ctl); return false; }
+		if (!gWrite(ctl, (uint8_t)off)) { gStop(ctl); return false; }
+		gStart(ctl);
+		if (!gWrite(ctl, (0x50 << 1) | 1)) { gStop(ctl); return false; }
+		for (uint32_t i = 0; i < len; i++) out[i] = gRead(ctl, i + 1 < len);
+		gStop(ctl);
+		return true;
+	}
+	static bool edidBlockValid(const uint8_t *b) {
+		uint8_t sum = 0;
+		for (int i = 0; i < 128; i++) sum += b[i];
+		return sum == 0;
+	}
+	static bool edidHeaderOk(const uint8_t *b) { return b[0] == 0 && b[1] == 0xff && b[7] == 0; }
+	static bool tryBlock(void *ctl, uint32_t pin, int method, uint32_t off, uint8_t *dst) {
+		bool ok = (method <= 1) ? gmbusReadChunk(ctl, pin, off, dst, 128, method) : gpioReadBlock(ctl, pin, off, dst, 128);
+		return ok && edidBlockValid(dst);
+	}
+	// GMBUS pin pair for the target port: the platform table carries it (cfg->gmbus); otherwise DDI A/B/C -> pins 1/2/3.
+	static uint32_t primaryPin() {
+		const PortConfig *cfg = getPortByDDI ? configOf(getPortByDDI(tddi)) : nullptr;
+		uint32_t p = cfg ? cfg->gmbus : 0;
+		if (p >= 1 && p <= 12) return p;   // GMBUS pins 1..12 (ICL: 1-3 combo, 9-12 type-C)
+		p = tddi + 1;
+		return (p >= 1 && p <= 3) ? p : 2;
+	}
+	// igfxhdmib-rgb: drop the sink's advertised YCbCr support (base block byte 24 bits 4:3, CEA extension byte 3 bits 5:4) so the
+	// driver keeps the link in RGB. `ext` = 0 for the base block, 1 for the first extension. Fixes the checksum.
+	static void sanitizeEdid(uint8_t *b, int ext) {
+		if (rgbOnly <= 0 || !b) return;
+		bool changed = false;
+		if (ext == 0 && b[0] == 0x00 && b[1] == 0xff && (b[20] & 0x80) && (b[24] & 0x18)) { b[24] &= (uint8_t)~0x18; changed = true; }
+		if (ext == 0 && rgbOnly >= 2 && b[0] == 0x00 && b[1] == 0xff && b[126] != 0) { b[126] = 0; changed = true; }   // no extension blocks
+		if (ext == 1 && b[0] == 0x02 && b[1] >= 2 && (b[3] & 0x30)) { b[3] &= (uint8_t)~0x30; changed = true; }
+		if (changed) { uint8_t sum = 0; for (int i = 0; i < 127; i++) sum = (uint8_t)(sum + b[i]); b[127] = (uint8_t)(0x100 - sum); }
+	}
+	static bool readLiveEdid(void *ctl) {
+		if (!readReg || !writeReg || !ctl) return false;
+		ensurePW();
+		uint8_t tmp[128];
+		if (liveEdidOk) {
+			// Already known (wake from sleep, screen saver...): one quick revalidation. If it is the same monitor, keep the cache.
+			// A different monitor OR a sink that does not answer falls through to the full read: a stale EDID of a previous monitor
+			// is worse than none (wrong modes, wrong colour format).
+			uint32_t pin = gmPin <= 3 ? gmPin : primaryPin();
+			bool ok = tryBlock(ctl, pin, 0, 0, tmp);
+			if (!ok && gmMode >= 1) ok = tryBlock(ctl, pin, (int)gmMode, 0, tmp);
+			if (ok && edidHeaderOk(tmp)) {
+				sanitizeEdid(tmp, 0);
+				for (int i = 0; i < 128; i++) if (tmp[i] != liveEdid[i]) { liveEdidOk = false; break; }
+			} else {
+				liveEdidOk = false;
+			}
+			if (liveEdidOk) return true;
+		}
+		liveEdidOk = false;
+		edidFullReads++;                       // observation: cache dropped, up to 3 methods x 3 pins x 6 attempts follow
+		uint32_t first = primaryPin(), pins[3], n = 0;
+		pins[n++] = first;
+		for (uint32_t p = 1; p <= 3; p++) if (p != first) pins[n++] = p;
+		for (int method = 0; method <= 2 && !liveEdidOk; method++) {          // 0,1 = GMBUS, 2 = GPIO bit-bang
+			unsigned npins = (method < 2) ? 1 : 3;                            // GMBUS only on the platform pin, GPIO tries all
+			for (unsigned pi = 0; pi < npins && !liveEdidOk; pi++) {
+				for (int attempt = 0; attempt < 6 && !liveEdidOk; attempt++) {   // a freshly plugged monitor can need a few ms before DDC answers
+					if (tryBlock(ctl, pins[pi], method, 0, tmp)) {
+						if (!edidHeaderOk(tmp)) continue;
+						gmPin = pins[pi]; gmMode = method; gmBlocks = 1;
+						for (int i = 0; i < 128; i++) liveEdid[i] = tmp[i];
+						if (tmp[126] >= 1) {
+							uint8_t t2[128];
+							if (tryBlock(ctl, pins[pi], method, 128, t2)) {
+								for (int i = 0; i < 128; i++) liveEdid[128 + i] = t2[i];
+								gmBlocks = 2;
+							}
+						}
+						{   // decide the colour-format handling for THIS sink from its raw EDID, then apply it
+							bool adv = (liveEdid[24] & 0x18) || (gmBlocks >= 2 && liveEdid[128] == 0x02 && (liveEdid[131] & 0x30));
+							rgbOnly = rgbMode < 0 ? (adv ? 2 : 0) : rgbMode;
+							sanitizeEdid(liveEdid, 0);
+							if (gmBlocks >= 2) sanitizeEdid(liveEdid + 128, 1);
+							if (rgbOnly >= 2) gmBlocks = 1;
+						}
+						liveEdidOk = true;
+					} else {
+						IODelay(2000);
+					}
+				}
+			}
+		}
+		if (liveEdidOk) edidReads++; else edidFails++;
+		return liveEdidOk;
+	}
+
+	// Generic 1024x768@60 EDID (VESA DMT 0x10, 65 MHz), only used with igfxhdmib-edid-fallback=1 when the monitor does not answer.
+	static uint8_t fallbackEdid[128];
+	static bool fallbackBuilt = false;
+	static void buildFallbackEdid() {
+		if (fallbackBuilt) return;
+		static const uint8_t base[128] = {
+			0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x00,                       // header
+			0x20, 0x8d, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x24,          // manufacturer "HDM", product 1, week 1, year 2026
+			0x01, 0x03,                                                           // EDID 1.3
+			0x80, 0x1e, 0x17, 0x78, 0x02,                                         // digital, 30x23 cm, gamma 2.2, preferred timing
+			0xee, 0x91, 0xa3, 0x54, 0x4c, 0x99, 0x26, 0x0f, 0x50, 0x54,          // chromaticity (sRGB)
+			0x21, 0x08, 0x00,                                                     // 640x480@60, 800x600@60, 1024x768@60
+			0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, // standard timings: unused
+			0x64, 0x19, 0x00, 0x40, 0x41, 0x00, 0x26, 0x30, 0x18, 0x88, 0x36, 0x00, 0x30, 0xe4, 0x10, 0x00, 0x00, 0x18, // DTD 1024x768@60
+			0x00, 0x00, 0x00, 0xfc, 0x00, 'H', 'D', 'M', 'I', ' ', 'F', 'a', 'l', 'l', 'b', 'k', 0x0a, 0x20,           // name "HDMI Fallbk"
+			0x00, 0x00, 0x00, 0xfd, 0x00, 0x32, 0x4b, 0x1e, 0x3c, 0x08, 0x00, 0x0a, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, // range limits
+			0x00, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // dummy
+			0x00, 0x00};                                                          // extension count, checksum
+		uint8_t sum = 0;
+		for (int i = 0; i < 127; i++) { fallbackEdid[i] = base[i]; sum += base[i]; }
+		fallbackEdid[127] = (uint8_t)(0x100 - sum);
+		fallbackBuilt = true;
+	}
+	// The 128-byte EDID block we answer with, or nullptr if we have none (then Apple's own answer stands).
+	static const uint8_t *edidFor(uint32_t block) {
+		if (liveEdidOk) {
+			if (block == 1) return liveEdid;
+			if (block == 2 && gmBlocks >= 2) return liveEdid + 128;
+			return nullptr;
+		}
+		if (edidFallback && block == 1) { buildFallbackEdid(); return fallbackEdid; }
+		return nullptr;
+	}
+
+	// ---------------------------------------------------------------------------------------------------------------------
+	// Sink detection (HDMI has no AUX channel: presence is HPD)
+	// ---------------------------------------------------------------------------------------------------------------------
+	static uint32_t wrapProbePortState(void *that) {
+		if (!isTarget(that)) return orgProbePortState(that);
+		bool hpdLow = isHPDLow ? isHPDLow(that) : true;
+		if (hpdLow) {
+			// Do NOT write 0 here. HPD on this port pulses low for a few milliseconds during every sleep/wake cycle, and
+			// that is exactly when Apple calls probePortState to decide whether the framebuffer still owns a pipe. Writing
+			// 0 at that moment takes the framebuffer off the wake list, which is precisely the failure shape we chase:
+			// the framebuffer keeps its old timing (IOFBCurrentPixelClock stayed 148.5 MHz) but loses AAPL,DisplayPipe
+			// (0xFFFF), hotplugs freeze, and only a reboot brings the port back.
+			//
+			// Measured 2026-11-22, seven wakes from one boot: wakes 1-6 each produced TWO "AppleIntelFramebuffer ...
+			// SetState to 2" acks (24xx ms and 4748 ms) and took 7.37-7.41 s; wake 7 produced only the 24xx ms one and
+			// finished in 2.596 s, i.e. 4.79 s early - the whole restore stage of that framebuffer never ran. It was not
+			// "the panel failed to light", it was "the panel was not asked to". Keeping the previous value (2 stays 2,
+			// 0 stays 0) costs nothing when the port is really alive, and Apple's own hotplug handler - still called for
+			// every edge, unchanged - is what retires a genuinely unplugged sink.
+			hpdLowProbes++;
+			return rd<uint32_t>(that, L->portState);
+		}
+		wr<uint32_t>(that, L->portState, 1);
+		return 1;
+	}
+	static int wrapSetDPPower(void *that, uint8_t state) {
+		if (!isTarget(that)) return orgSetDPPower(that, state);
+		return 0;                                  // HDMI sink has no AUX/DPCD: pretend the wake-up worked
+	}
+	static int wrapGetSinkCount(void *that, uint8_t *count) {
+		if (!isTarget(that)) return orgGetSinkCount(that, count);
+		if (count) *count = 1;
+		return 0;
+	}
+	static int wrapGetDPCDInfo(void *that) {
+		if (!isTarget(that)) return orgGetDPCDInfo(that);
+		return 0;
+	}
+	static int wrapGetDDCBlock(void *that, uint32_t block, uint8_t *buf, bool flag) {
+		if (!isTarget(that)) return orgGetDDCBlock(that, block, buf, flag);
+		// No ensurePW() here. This call site runs once per wake, inside Apple's own DDC transaction, and the power-well write
+		// is a Haswell-style guess (STATE at bit 2n, REQUEST at 2n+1) aimed at an Ice Lake register Apple is actively
+		// driving: waking from sleep is exactly when the wells are in transition. Measured enpw went up by exactly one per
+		// wake even on the wakes that failed with a flat GMBUS counter, i.e. this site was the only code touching a register.
+		// If Apple's read fails because the well is genuinely down, the cached EDID below covers it.
+		int ret = orgGetDDCBlock(that, block, buf, flag);
+		if (ret != 0 && (block == 1 || block == 2) && buf) {
+			// The sink did not answer through Apple's (DisplayPort-oriented) DDC path: hand over the EDID we read ourselves
+			if (auto src = edidFor(block)) { for (int i = 0; i < 128; i++) buf[i] = src[i]; ret = 0; }
+		} else if (ret == 0 && (block == 1 || block == 2) && buf) {
+			sanitizeEdid(buf, (int)block - 1);     // Apple's own read worked: same RGB-only treatment
+		}
+		return ret;
+	}
+	static IOReturn wrapGetOnlineInfo(void *that, void *path, uint8_t *a, uint8_t *b) {
+		auto ret = orgGetOnlineInfo(that, path, a, b);
+		if (a && b && isTargetFb(that) && getPortByDDI && isHPDLow) {
+			// The caller sets fb->flags = *online: report the HDMI sink as online together with its EDID
+			auto prt = getPortByDDI(tddi);
+			if (ptrOk(prt) && !isHPDLow(prt) && rd<uint32_t>(prt, L->portState) != 0) {
+				if (auto src = edidFor(1)) {
+					*a = 1;
+					for (int i = 0; i < 128; i++) b[i] = src[i];
+					ret = 0;
+				}
+			}
+		}
+		return ret;
+	}
+
+	// ---------------------------------------------------------------------------------------------------------------------
+	// Hotplug
+	// ---------------------------------------------------------------------------------------------------------------------
+	static void wrapHotplug(void *ctl, uint32_t ddi, uint32_t portMode);
+
+	// If the cable is already plugged at boot Apple never calls invokeHotplugHandler for the port (no HPD edge). After a delay run
+	// the same hotplug once, from a timer on the controller's own workloop (same context as Apple's interrupt handler).
+	static bool bootArmed = false;
+	static void bootDetectFire(OSObject *owner, IOTimerEventSource *) {
+		void *ctl = owner;
+		if (hotplugs != 0 || !getPortByDDI || !isHPDLow || !L) return;
+		auto port = getPortByDDI(tddi);
+		if (ptrOk(port) && !isHPDLow(port)) wrapHotplug(ctl, tddi, lastPortMode ? lastPortMode : 1);
+	}
+	static void armBootDetect(void *ctl) {
+		if (bootArmed || bootDetectSec <= 0 || !ptrOk(ctl)) return;
+		bootArmed = true;
+		auto svc = reinterpret_cast<IOService *>(ctl);
+		IOWorkLoop *wl = svc->getWorkLoop();
+		if (!wl) { HLOG("boot detect: no workloop"); return; }
+		IOTimerEventSource *t = IOTimerEventSource::timerEventSource(reinterpret_cast<OSObject *>(ctl), bootDetectFire);
+		if (!t) { HLOG("boot detect: no timer"); return; }
+		if (wl->addEventSource(t) != 0) { HLOG("boot detect: addEventSource failed"); return; }
+		t->setTimeoutMS((UInt32)bootDetectSec * 1000u);
+	}
+
+	static void wrapHotplug(void *ctl, uint32_t ddi, uint32_t portMode) {
+		bool tgt = (ddi == tddi);
+		if (tgt) {
+			hotplugs++;
+			lastPortMode = portMode;
+			gCtl = ctl;
+			sampleDbuf(ctl);
+			// An HPD pulse is NOT evidence that the sink changed: on this port the line bounces a dozen times per wake and
+			// every bounce used to drop the EDID cache, which turned the next bounce into a full re-read (up to 3 methods x
+			// 3 pins x 6 attempts, plus IODelay(2000) between failures). Measured: a healthy wake cost 9 GMBUS transactions,
+			// the failing one 46 GMBUS transactions and 16 full re-reads - all of it executed *before* orgHotplug(), so
+			// Apple's own hot-plug processing was delayed until the line had already fallen back and it concluded the cable
+			// was pulled (portState = 0, no pipe, dead until reboot). Read the sink only when we do not have its EDID yet;
+			// a genuinely different monitor is still caught by the content comparison in readLiveEdid() and by Apple's own
+			// DDC read in wrapGetDDCBlock().
+			if (!liveEdidOk) readLiveEdid(ctl);
+		}
+		orgHotplug(ctl, ddi, portMode);
+		if (!tgt) return;
+
+		// Nobody tells IOFramebuffer about the connect on this port. Build what the AGDC client never builds for an injected
+		// framebuffer and then do what Apple's own InjectHPD() does: deliver the connect interrupt.
+		if (injectHPD && getPortByDDI && isHPDLow) {
+			auto port = reinterpret_cast<uint8_t *>(getPortByDDI(tddi));
+			if (ptrOk(port) && !isHPDLow(port) && (rd<uint32_t>(port, L->portState) == 2 || rd<uint32_t>(port, L->portState) == 1)) {
+				uint32_t idx = rd<uint32_t>(port, L->portIndex);
+				uint32_t nfb = rd<uint32_t>(ctl, L->ctlFbCount);
+				if (idx < nfb && idx < 3) {
+					auto fb = rd<uint8_t *>(ctl, L->ctlFbArray + 8 * idx);
+					if (ptrOk(fb) && rd<uint32_t>(fb, L->fbIndex) == idx) {
+						if (!fbIdxFixed && fbIdx != (int)idx) { HLOG("target framebuffer is %u (expected %d)", idx, fbIdx); fbIdx = (int)idx; }
+						ensurePW();
+						if (connChanged) connChanged(fb);                   // make the framebuffer re-probe the sink (EDID)
+						if (orgCallbackAGDC) orgCallbackAGDC(ctl, 0, idx, 0);   // class-2 connects only emit event 1; the client expects event 0
+						if (addDispPath) {
+							// give the framebuffer a display path and an active flag ourselves (the AGDC client never commits it)
+							auto cnt = reinterpret_cast<uint32_t *>(fb + L->fbPathCount);
+							if (*cnt == 0) {
+								ensurePW();
+								if (allocPathRes) allocPathRes(fb, idx, 0);     // Apple's per-port allocator: path, port, scaler, plane, pipe
+								else addDispPath(fb, 0xffff);
+							}
+							if (*cnt) {
+								// addDisplayPath leaves path->port null; Apple's allocateDisplayPathResources sets it
+								auto dpx = rd<uint8_t *>(fb, L->fbPath0);
+								auto prt = getPortByDDI(tddi);
+								if (ptrOk(dpx) && ptrOk(prt) && rd<void *>(dpx, L->pathPort) == nullptr) wr<void *>(dpx, L->pathPort, prt);
+							}
+							wr<uint8_t>(fb, L->fbFlags, rd<uint8_t>(fb, L->fbFlags) | 1);
+							// resource-configuration table (count + entry 0), cloned from the internal framebuffer's committed one,
+							// so setupDisplayTiming() can resolve the entry index it gets back from the client
+							auto fb0 = rd<uint8_t *>(ctl, L->ctlFbArray);
+							if (ptrOk(fb0) && fb0 != fb && rd<uint32_t>(fb, L->fbCfgTable) == 0)
+								for (uint32_t i = 0; i < L->fbCfgTableLen; i++) fb[L->fbCfgTable + i] = fb0[L->fbCfgTable + i];
+						}
+						injectHPD(ctl, fb);
+					}
+				}
+			}
+		}
+		// Read-only sentinel: the state that has to survive a sleep cycle for the port to come back. Every value is
+		// read from an offset the module already uses, and nothing is written here.
+		if (getPortByDDI && L && readReg) {
+			auto sport = reinterpret_cast<uint8_t *>(getPortByDDI(tddi));
+			if (ptrOk(sport)) {
+				uint32_t sidx = rd<uint32_t>(sport, L->portIndex);
+				uint32_t snfb = rd<uint32_t>(ctl, L->ctlFbCount);
+				if (sidx < snfb && sidx < 3) {
+					auto sfb = rd<uint8_t *>(ctl, L->ctlFbArray + 8 * sidx);
+					if (ptrOk(sfb)) {
+						senIdx   = sidx;
+						senPaths = rd<uint32_t>(sfb, L->fbPathCount);
+						senFlags = rd<uint8_t>(sfb, L->fbFlags);
+						senPw2   = readReg(ctl, REG_PWR_WELL_CTL2);
+						senPst   = rd<uint32_t>(sport, L->portState);
+						HLOG_ALWAYS("sentinel: fb=%u paths=%u flags=0x%x pwrwell2=0x%08x portstate=%u hotplugs=%u",
+						            senIdx, senPaths, senFlags, senPw2, senPst, hotplugs);
+					}
+				}
+			}
+		}
+		publishStatus();
+	}
+
+	static uint32_t wrapLightUpTMDS(void *ctl, void *fb, void *path, void *timing) {
+		if (isTargetFb(fb)) sampleDbuf(ctl);
+		return orgLightUpTMDS(ctl, fb, path, timing);
+	}
+	static uint32_t wrapHwSetMode(void *ctl, void *fb, void *path, int m, void *timing) {
+		armBootDetect(ctl);
+		if (isTargetFb(fb)) sampleDbuf(ctl);
+		return orgHwSetMode(ctl, fb, path, m, timing);
+	}
+
+	// ---------------------------------------------------------------------------------------------------------------------
+	// AGDC (accelerator <-> display driver) callbacks and AUX
+	// ---------------------------------------------------------------------------------------------------------------------
+	static bool wrapCallbackAGDC(void *c, uint32_t ev, unsigned long port, uint32_t arg) {
+		if ((ev == 10 || ev == 12) && port > 0x1000 && ptrOk(reinterpret_cast<void *>(port)) &&
+			*reinterpret_cast<uint32_t *>(port) == (uint32_t)fbIdx) {
+			if (ev == 10) return false;            // validateDetailedTiming: the client has no configuration for this framebuffer,
+			                                       // answer "no opinion" and let the kext's own validation decide
+			// kAGDCRegisterLinkModesetCallback: the client would pick the resource-config entry for this mode. The injected
+			// framebuffer has exactly one (cloned) entry: index 0.
+			wr<int32_t>(reinterpret_cast<void *>(port), L->agdcCfgIndex, 0);
+			return true;
+		}
+		return orgCallbackAGDC(c, ev, port, arg);
+	}
+	// HDMI has no AUX channel, but the accelerator keeps reading DPCD through GetStreamAccessAUX on the HDMI stream (AGDC port =
+	// framebuffer index + 1). Left alone, every read times out inside the controller and stalls the system for a minute after
+	// plugging — that is why this block exists, and igfxhdmib-aux=1 still restores it.
+	//
+	// Default is 0 because blocking it also breaks wake from sleep. Measured on this machine: Apple reads the EDID through this
+	// same entry while it rebuilds the link after a wake. With the block active the read returns an error, HDMIB-edid became
+	// "none", the accelerator retried (aux-blocked=1596, hotplugs 1->34) and the port dropped to portstate=0 within two minutes;
+	// the panel never came back and successive fast sleep/wake cycles made it worse. HPD does glitch on its own during a wake
+	// (edid-forgotten still increments with the cable untouched), so the link always has to be rebuilt — the block removed the
+	// only path that could rebuild it. With aux=0 that glitch is absorbed: the re-read succeeds (edid-ok increments, edid-fail
+	// stays 0), portstate stays 2 and six consecutive sleep/wake cycles stay healthy.
+	static IOReturn wrapStreamAux(void *c, void *in, void *out) {
+		uint32_t port = (in && ptrOk(in)) ? *reinterpret_cast<uint32_t *>(in) : 0xffff;
+		if (auxBlockEnabled && port == (uint32_t)fbIdx + 1 && out && ptrOk(out)) {
+			*reinterpret_cast<uint16_t *>(reinterpret_cast<uint8_t *>(out) + 0xe) = 2;
+			auxBlocked++;
+			return (IOReturn)0xe00002bc;
+		}
+		return orgStreamAux(c, in, out);
+	}
+
+	// ---------------------------------------------------------------------------------------------------------------------
+	// Hardware cursor. The injected framebuffer has no cursor memory (fb+fbCursorMem never set up): Apple's code then faults in
+	// hwSetCursorImage. With igfxhdmib-hwcursor=1 we call Apple's own hwUpdateCursorMemory() once and check the buffers lie inside
+	// the controller's cursor region; if anything looks wrong we refuse the hardware cursor and IOFramebuffer falls back to software.
+	// ---------------------------------------------------------------------------------------------------------------------
+	static bool fbHwCursorOk(void *ctl, void *fb) {
+		if (!hwCursorFb || swCursorAll || !orgUpdateCursorMem || !ptrOk(ctl) || !ptrOk(fb)) return false;
+		uint32_t a0 = rd<uint32_t>(fb, L->fbCursorMem), a1 = rd<uint32_t>(fb, L->fbCursorMem + 4);
+		if (a0 == 0 && a1 == 0) {
+			auto pth = rd<uint8_t *>(fb, rd<uint32_t>(fb, L->fbPathSel) == 0xffffffffu ? L->fbPath0 : L->fbPathAlt);
+			if (!ptrOk(pth)) return false;
+			orgUpdateCursorMem(ctl, fb);
+			a0 = rd<uint32_t>(fb, L->fbCursorMem); a1 = rd<uint32_t>(fb, L->fbCursorMem + 4);
+		}
+		uint64_t base = rd<uint64_t>(ctl, L->ctlCursorPhys);
+		uint32_t size = rd<uint32_t>(ctl, L->ctlCursorSize);
+		uint64_t cpu = rd<uint64_t>(ctl, L->ctlCursorCpu);
+		uint32_t o0 = a0 - (uint32_t)base, o1 = a1 - (uint32_t)base;
+		return cpu != 0 && size != 0 && o0 < size && o1 < size && (uint64_t)o0 + 0x40000 <= size && (uint64_t)o1 + 0x40000 <= size;
+	}
+	static bool cursorBlockedFor(void *ctl, void *fb) {
+		if (!ptrOk(fb)) return false;
+		bool tgt = isTargetFb(fb);
+		if (tgt && fbHwCursorOk(ctl, fb)) return false;
+		return tgt || swCursorAll != 0;
+	}
+	static uint32_t wrapHwSetCursorImage(void *ctl, void *fb, void *info) {
+		if (cursorBlockedFor(ctl, fb)) { if (++cursorBlocked == 1) HLOG("hardware cursor refused on the HDMI framebuffer (software cursor)"); return 0xe00002c7; }
+		return orgHwSetCursorImage(ctl, fb, info);
+	}
+	static uint32_t wrapHwSetCursorState(void *ctl, void *fb, int a, int b, bool c, bool d) {
+		if (cursorBlockedFor(ctl, fb)) { cursorBlocked++; return 0xe00002c7; }
+		return orgHwSetCursorState(ctl, fb, a, b, c, d);
+	}
+
+	// ---------------------------------------------------------------------------------------------------------------------
+	// Work-arounds
+	// ---------------------------------------------------------------------------------------------------------------------
+	// The HDMI timing generates VRR errors every ~11 s: no VRR on that framebuffer.
+	static void wrapInitVRRCaps(void *fb) {
+		orgInitVRRCaps(fb);
+		if (isTargetFb(fb)) { for (uint32_t i = 0; i < 5; i++) wr<uint8_t>(fb, L->fbVrr + i, 0); vrrOff++; }
+	}
+	// Apple panics ("[IGFB][PANIC][POWER] DC6 is already enabled - bailing out") when enableHWDC6() runs while its reference count is
+	// already > 0, i.e. two enables without a disable in between. This happens from setDisplayMode -> disableDisplay during repeated
+	// HDMI hot-plugging. Skipping the extra enable leaves DC6 enabled by the first one; a later disable turns it off.
+	static void wrapEnableHWDC6(void *c) {
+		if (dc6FixEnabled && ptrOk(c) && rd<int32_t>(c, L->ctlDC6Count) > 0) { dc6Skipped++; return; }
+		orgEnableHWDC6(c);
+	}
+
+	// ---------------------------------------------------------------------------------------------------------------------
+	// v1: connector patch baked into the driver.
+	// WhateverGreen's IGFX::processKernel() calls loadPatchesFromDevice(info->videoBuiltin, ...) which reads
+	// framebuffer-patchN-* straight off the iGPU device node. We push those properties there before that call runs, so the
+	// upstream patch code does the work with its normal validation and logging - no config.plist entry is needed.
+	// Entry for platform id 01005c8a: 4th connector {ddi 3, gmbus 10, class 1, pad 1, type 0x400 DP, flags 0x2c1}
+	// becomes {ddi 1, gmbus 2, class 2, pad 0, type 0x800 HDMI, flags 0x2c1} = HDMI on DDI B, GMBUS pin 2.
+	// ---------------------------------------------------------------------------------------------------------------------
+	static void injectDeviceProperties(IORegistryEntry *igpu) {
+		if (!igpu) return;
+		if (igpu->getProperty("framebuffer-patch0-find")) {          // user already configured it: respect that
+			HLOG_ALWAYS("connector patch already present on the iGPU, injection skipped");
+			return;
+		}
+		// WhateverGreen reads these with OSDynamicCast(OSData, ...): hand it real OSData objects.
+		auto setBytes = [&](const char *key, const void *bytes, uint32_t len) {
+			auto data = OSData::withBytes(bytes, len);
+			if (!data) return;
+			igpu->setProperty(key, data);
+			data->release();
+		};
+		static const uint32_t find[6]    = {3, 10, 1, 1, 0x400, 0x2c1};
+		static const uint32_t replace[6] = {1, 2,  2, 0, 0x800, 0x2c1};
+		uint32_t on = 1;
+		setBytes("framebuffer-patch-enable", &on, sizeof(on));
+		setBytes("framebuffer-patch0-enable", &on, sizeof(on));
+		setBytes("framebuffer-patch0-find", find, sizeof(find));
+		setBytes("framebuffer-patch0-replace", replace, sizeof(replace));
+		HLOG_ALWAYS("connector patch injected: ddi 3/DP -> ddi 1/HDMI (gmbus=2, type=0x800)");
+	}
+
+	// ---------------------------------------------------------------------------------------------------------------------
+	// Installation. Called from IGFX::processKext for the framebuffer kext.
+	// ---------------------------------------------------------------------------------------------------------------------
+	static inline int intArg(const char *name, int def) { int v = def; PE_parse_boot_argn(name, &v, sizeof(v)); return v; }
+
+	template <typename F> static inline void optRoute(KernelPatcher &patcher, size_t index, mach_vm_address_t address, size_t size, const char *sym, F wrap, F &org, const char *what) {
+		KernelPatcher::RouteRequest rq(sym, wrap, org);
+		if (!patcher.routeMultiple(index, &rq, 1, address, size)) HLOG_ALWAYS("optional hook %s could not be routed", what);
+	}
+
+	static inline void install(KernelPatcher &patcher, size_t index, mach_vm_address_t address, size_t size) {
+		if (checkKernelArgument("-igfxhdmiboff")) return;     // v1: active by default, no boot-arg needed to enable
+		if (kextIntelICLLPFb.loadIndex != index) return;      // only the Ice Lake LP framebuffer kext
+		HLOG_ALWAYS("v%s starting on Darwin %u", Version, (unsigned)getKernelVersion());
+
+		const LayoutEntry *le = nullptr;
+		for (auto &e : layouts) if (e.darwin == (uint32_t)getKernelVersion()) { le = &e; break; }
+		if (!le) {
+			HLOG_ALWAYS("Darwin %u has no known structure layout: module idle", (unsigned)getKernelVersion());
+			setRoot("HDMIB-layout", "unknown-darwin: idle");
+			return;
+		}
+		if (!le->verified && intArg("igfxhdmib-force", 0) == 0) {
+			HLOG_ALWAYS("layout for %s is not verified: module idle (igfxhdmib-force=1 to run anyway at your own risk)", le->name);
+			setRoot("HDMIB-layout", "unverified: idle");
+			return;
+		}
+		L = &le->l;
+		HLOG_ALWAYS("layout: %s%s", le->name, le->verified ? "" : " (UNVERIFIED, forced)");
+		setRoot("HDMIB-layout", le->verified ? le->name : "unverified: forced");
+
+		setRoot("HDMIB-version", Version);
+		{ int d = intArg("igfxhdmib-ddi", 1); tddi = (uint32_t)((d >= 0 && d <= 5) ? d : 1); }
+		{ int f = intArg("igfxhdmib-fb", -1); if (f >= 0 && f < 3) { fbIdx = f; fbIdxFixed = true; } }
+		bootDetectSec = intArg("igfxhdmib-bootdetect", 3);
+		if (bootDetectSec < 0 || bootDetectSec > 60) bootDetectSec = 3;
+		hwCursorFb = intArg("igfxhdmib-hwcursor", 1);
+		swCursorAll = intArg("igfxhdmib-swcursor", 0);
+		auxBlockEnabled = intArg("igfxhdmib-aux", 0);
+		dc6FixEnabled = intArg("igfxhdmib-dc6fix", 1);
+		edidFallback = intArg("igfxhdmib-edid-fallback", 0);
+		rgbMode = intArg("igfxhdmib-rgb", -1);
+
+		auto solve = [&](const char *sym) { return patcher.solveSymbol(index, sym, address, size); };
+		auto gp = solve("__ZN14AppleIntelPort12getPortByDDIEj");
+		auto hp = solve("__ZN14AppleIntelPort8isHPDLowEv");
+		auto rr = solve("__ZN31AppleIntelFramebufferController14ReadRegister32Em");
+		auto wrg = solve("__ZN31AppleIntelFramebufferController15WriteRegister32Emj");
+		auto cc = solve("__ZN21AppleIntelFramebuffer17connectionChangedEv");
+		auto adp = solve("__ZN21AppleIntelFramebuffer14addDisplayPathEj");
+		auto apr = solve("__ZN21AppleIntelFramebuffer28allocateDisplayPathResourcesEjj");
+		auto ihpd = solve("__ZN31AppleIntelFramebufferController9InjectHPDEP21AppleIntelFramebuffer");
+		auto uc = solve("__ZN31AppleIntelFramebufferController20hwUpdateCursorMemoryEP21AppleIntelFramebuffer");
+		if (!gp || !hp || !rr || !wrg || !ihpd) {
+			HLOG_ALWAYS("required symbols missing (getPortByDDI=%d isHPDLow=%d ReadRegister32=%d WriteRegister32=%d InjectHPD=%d): module idle",
+			            gp != 0, hp != 0, rr != 0, wrg != 0, ihpd != 0);
+			setRoot("HDMIB-hooks", "symbols-missing: idle");
+			return;
+		}
+		getPortByDDI = reinterpret_cast<void *(*)(uint32_t)>(gp);
+		isHPDLow = reinterpret_cast<bool (*)(void *)>(hp);
+		readReg = reinterpret_cast<uint32_t (*)(void *, unsigned long)>(rr);
+		writeReg = reinterpret_cast<void (*)(void *, unsigned long, uint32_t)>(wrg);
+		injectHPD = reinterpret_cast<void (*)(void *, void *)>(ihpd);
+		if (cc) connChanged = reinterpret_cast<uint32_t (*)(void *)>(cc);
+		if (adp) addDispPath = reinterpret_cast<void *(*)(void *, uint32_t)>(adp);
+		if (apr) allocPathRes = reinterpret_cast<uint8_t (*)(void *, uint32_t, uint32_t)>(apr);
+		if (uc) orgUpdateCursorMem = reinterpret_cast<void (*)(void *, void *)>(uc);
+
+		// Core hooks: without all of them the port cannot work, so they are routed as one group.
+		KernelPatcher::RouteRequest core[] = {
+			{"__ZN14AppleIntelPort14probePortStateEv", wrapProbePortState, orgProbePortState},
+			{"__ZN21AppleIntelFramebuffer13getOnlineInfoEP21AppleIntelDisplayPathPhS2_", wrapGetOnlineInfo, orgGetOnlineInfo},
+			{"__ZN31AppleIntelFramebufferController20invokeHotplugHandlerEjN14AppleIntelPort8PortModeE", wrapHotplug, orgHotplug},
+			{"__ZN14AppleIntelPort15setDPPowerStateEh", wrapSetDPPower, orgSetDPPower},
+			{"__ZN14AppleIntelPort14getDPSinkCountEPh", wrapGetSinkCount, orgGetSinkCount},
+			{"__ZN14AppleIntelPort11getDPCDInfoEv", wrapGetDPCDInfo, orgGetDPCDInfo},
+			{"__ZN14AppleIntelPort11getDDCBlockEjPhb", wrapGetDDCBlock, orgGetDDCBlock},
+			{"__ZN31AppleIntelFramebufferController18GetStreamAccessAUXEP21AGDCStreamAccessAUX_tS1_", wrapStreamAux, orgStreamAux},
+			{"__ZN31AppleIntelFramebufferController12CallBackAGDCE31kAGDCRegisterLinkControlEvent_tmj", wrapCallbackAGDC, orgCallbackAGDC},
+		};
+		if (!patcher.routeMultiple(index, core, arrsize(core), address, size)) {
+			HLOG_ALWAYS("failed to route the core hooks (error %d): HDMI will not work", (int)patcher.getError());
+			setRoot("HDMIB-hooks", "core-route-failed");
+			return;
+		}
+		// Hooks that improve behaviour but are not essential: a failure of one does not stop the others.
+		optRoute(patcher, index, address, size, "__ZN31AppleIntelFramebufferController11LightUpTMDSEP21AppleIntelFramebufferP21AppleIntelDisplayPathPK29IODetailedTimingInformationV2", wrapLightUpTMDS, orgLightUpTMDS, "LightUpTMDS");
+		optRoute(patcher, index, address, size, "__ZN31AppleIntelFramebufferController9hwSetModeEP21AppleIntelFramebufferP21AppleIntelDisplayPathiPK29IODetailedTimingInformationV2", wrapHwSetMode, orgHwSetMode, "hwSetMode");
+		optRoute(patcher, index, address, size, "__ZN31AppleIntelFramebufferController16hwSetCursorImageEP21AppleIntelFramebufferP20IOHardwareCursorInfo", wrapHwSetCursorImage, orgHwSetCursorImage, "hwSetCursorImage");
+		optRoute(patcher, index, address, size, "__ZN31AppleIntelFramebufferController16hwSetCursorStateEP21AppleIntelFramebufferiibb", wrapHwSetCursorState, orgHwSetCursorState, "hwSetCursorState");
+		optRoute(patcher, index, address, size, "__ZN21AppleIntelFramebuffer11initVRRCapsEv", wrapInitVRRCaps, orgInitVRRCaps, "initVRRCaps");
+		if (dc6FixEnabled)
+			optRoute(patcher, index, address, size, "__ZN31AppleIntelFramebufferController11enableHWDC6Ev", wrapEnableHWDC6, orgEnableHWDC6, "enableHWDC6");
+
+		HLOG_ALWAYS("hooks installed (ddi=%u fb=%d bootdetect=%ds hwcursor=%d)", tddi, fbIdx, bootDetectSec, hwCursorFb);
+		setRoot("HDMIB-hooks", "installed");
+		publishStatus();
+	}
+
+} // namespace HDMIB
+
+#endif /* kern_igfx_hdmib_hpp */
